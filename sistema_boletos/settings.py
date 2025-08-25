@@ -3,8 +3,10 @@ Django settings for sistema_boletos project.
 """
 
 from pathlib import Path
+from datetime import timedelta
 from decouple import config
-
+from decouple import config
+import cloudinary
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -14,7 +16,12 @@ SECRET_KEY = config('SECRET_KEY', default='unsafe-secret-key')
 
 DEBUG = config('DEBUG', default=False, cast=bool)
 
-ALLOWED_HOSTS = ['localhost', '127.0.0.1']
+CORS_ALLOWED_ORIGINS = [
+    "http://localhost:5173",
+]
+CORS_ALLOW_CREDENTIALS = True  # si vas a usar cookies; con JWT no es necesario
+CSRF_TRUSTED_ORIGINS = ["http://localhost:5173"]  # útil si alguna vista usa CSRF
+
 
 # Application definition
 INSTALLED_APPS = [
@@ -23,15 +30,39 @@ INSTALLED_APPS = [
     'django.contrib.contenttypes',
     'django.contrib.sessions',
     'django.contrib.messages',
+
+    'cloudinary_storage',
     'django.contrib.staticfiles',
+    'cloudinary',
     'rest_framework',
     'django_filters',
-    'accounts'
+    'corsheaders',
+    'accounts',
+    'catalog',
+
 ]
+
+CLOUDINARY_STORAGE = {
+    'CLOUD_NAME':  config('CLOUDINARY_CLOUD_NAME'),
+    'API_KEY':     config('CLOUDINARY_API_KEY'),
+    'API_SECRET':  config('CLOUDINARY_API_SECRET'),
+}
+
+# Config explícita para evitar “Must supply api_key”
+cloudinary.config(
+    cloud_name=CLOUDINARY_STORAGE['CLOUD_NAME'],
+    api_key=CLOUDINARY_STORAGE['API_KEY'],
+    api_secret=CLOUDINARY_STORAGE['API_SECRET'],
+    secure=True,
+)
+
+DEFAULT_FILE_STORAGE = 'cloudinary_storage.storage.MediaCloudinaryStorage'
+MEDIA_URL = '/media/'
 
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
+    'corsheaders.middleware.CorsMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
     'django.contrib.auth.middleware.AuthenticationMiddleware',
@@ -42,6 +73,7 @@ MIDDLEWARE = [
 
 ROOT_URLCONF = 'sistema_boletos.urls'
 
+# settings.py
 REST_FRAMEWORK = {
     'DEFAULT_AUTHENTICATION_CLASSES': (
         'rest_framework_simplejwt.authentication.JWTAuthentication',
@@ -51,7 +83,24 @@ REST_FRAMEWORK = {
     ),
     'DEFAULT_FILTER_BACKENDS': (
         'django_filters.rest_framework.DjangoFilterBackend',
+        # Si quieres que todas las vistas tengan búsqueda/orden por defecto:
+        # 'rest_framework.filters.SearchFilter',
+        # 'rest_framework.filters.OrderingFilter',
     ),
+    # 👇 Paginación global: 10 por página
+    'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.PageNumberPagination',
+    'PAGE_SIZE': 10,
+}
+
+ACCESS_TOKEN_MINUTES = config('ACCESS_TOKEN_MINUTES', cast=int, default=60)   # 1 hora
+REFRESH_TOKEN_DAYS   = config('REFRESH_TOKEN_DAYS',   cast=int, default=30)   # 30 días
+
+SIMPLE_JWT = {
+    'ACCESS_TOKEN_LIFETIME': timedelta(minutes=ACCESS_TOKEN_MINUTES),
+    'REFRESH_TOKEN_LIFETIME': timedelta(days=REFRESH_TOKEN_DAYS),
+    'ROTATE_REFRESH_TOKENS': True,        # opcional
+    'BLACKLIST_AFTER_ROTATION': True,     # opcional (necesita app blacklist)
+    'AUTH_HEADER_TYPES': ('Bearer',),
 }
 TEMPLATES = [
     {
@@ -113,3 +162,5 @@ STATIC_URL = 'static/'
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
 AUTH_USER_MODEL = 'accounts.User'
+PASSWORD_MAX_AGE_DAYS = 90
+REQUIRE_FIRST_LOGIN_CHANGE = False
