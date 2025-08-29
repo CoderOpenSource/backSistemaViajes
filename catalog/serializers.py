@@ -53,89 +53,317 @@ class OfficeSerializer(serializers.ModelSerializer):
 
 from rest_framework import serializers
 
+# apps/catalog/serializers.py
+from typing import List
+from django.db import IntegrityError, transaction
+from rest_framework import serializers
+
+from .models import Bus, Seat
+from .services import (
+                   # tu helper existente para generar code único
+    create_seats_from_blocks,
+    create_default_seats_for_bus,
+    SeatsAlreadyExist,
+)
+
+
+class SeatBlockSerializer(serializers.Serializer):
+    """
+    Bloque declarativo para crear asientos.
+    Ejemplo:
+    {
+      "deck": 1,
+      "kind": "SEMI_CAMA",
+      "count": 24,
+      "start_number": 1,        # opcional
+      "row": 1,                 # opcional (si mapeas grilla)
+      "col": 2,                 # opcional
+      "is_accessible": false    # opcional
+    }
+    """
+    deck = serializers.IntegerField(min_value=1, max_value=2)
+    kind = serializers.ChoiceField(choices=[k for k, _ in Seat.KIND_CHOICES])
+    count = serializers.IntegerField(min_value=1)
+    start_number = serializers.IntegerField(required=False)
+    row = serializers.IntegerField(required=False)
+    col = serializers.IntegerField(required=False)
+    is_accessible = serializers.BooleanField(required=False, default=False)
+
+# catalog/serializers.py
+from typing import List
+from django.db import transaction, IntegrityError
+from rest_framework import serializers
+
+from .models import Bus, Seat
+
+# serializers.py
+from rest_framework import serializers
+from django.db import transaction, IntegrityError
+from rest_framework import serializers
 
 class BusSerializer(serializers.ModelSerializer):
-    code = serializers.CharField(read_only=True)  # <- código generado, inmutable
+    code = serializers.CharField(read_only=True)
+
+    # mapear alias -> campos reales del modelo
+    photo_front = serializers.ImageField(source="photo1", required=False, allow_null=True, use_url=True)
+    photo_back  = serializers.ImageField(source="photo2", required=False, allow_null=True, use_url=True)
+    photo_left  = serializers.ImageField(source="photo3", required=False, allow_null=True, use_url=True)
+    photo_right = serializers.ImageField(source="photo4", required=False, allow_null=True, use_url=True)
+
+    seat_blocks = SeatBlockSerializer(many=True, required=False, write_only=True)
+
+    seats_count = serializers.SerializerMethodField(read_only=True)
+    seat_blocks_current = serializers.SerializerMethodField(read_only=True)
 
     class Meta:
         model = Bus
         fields = (
             "id", "code", "model", "year", "plate", "chassis_number",
-            "capacity", "active", "notes", "created_at"
+            "capacity", "active", "notes", "created_at",
+            "photo_front", "photo_back", "photo_left", "photo_right",
+            "seat_blocks", "seats_count", "seat_blocks_current",
         )
-        read_only_fields = ("created_at", "code")
+        read_only_fields = ("created_at", "code", "seats_count", "seat_blocks_current")
 
+    # --- normaliza borrado "" -> None (acepta alias y names crudos) ---
+    def validate(self, attrs):
+        initial = self.initial_data or {}
+        alias_to_source = {
+            "photo_front": "photo1",
+            "photo_back":  "photo2",
+            "photo_left":  "photo3",
+            "photo_right": "photo4",
+        }
+        # también soporta recibir photo1..photo4 directamente
+        for key in [*alias_to_source.keys(), "photo1", "photo2", "photo3", "photo4"]:
+            if key in initial and initial.get(key) == "":
+                attrs[alias_to_source.get(key, key)] = None
+        return attrs
+
+    # --- helpers ---
+    def _validate_blocks_against_capacity(self, capacity: int, blocks: list[dict]):
+        total = sum(int(b.get("count", 0)) for b in (blocks or []))
+        if total <= 0:
+            raise serializers.ValidationError({"seat_blocks": "La suma de 'count' debe ser mayor a 0."})
+        if capacity is None:
+            raise serializers.ValidationError({"capacity": "Debes especificar 'capacity'."})
+        if total != int(capacity):
+            raise serializers.ValidationError({
+                "seat_blocks": f"La suma de 'count' ({total}) debe coincidir con 'capacity' ({capacity})."
+            })
+
+    def get_seats_count(self, obj: Bus) -> int:
+        return getattr(obj, "_seats_count", None) or obj.seats.count()
+
+    def get_seat_blocks_current(self, obj: Bus):
+        qs = obj.seats.all().order_by("deck", "kind", "number").values("deck", "kind", "number")
+        blocks, last = [], None
+        for s in qs:
+            dk = (s["deck"], s["kind"]); num = s["number"]
+            if last is None:
+                last = [dk[0], dk[1], num, num, 1]; continue
+            if last[0] == dk[0] and last[1] == dk[1] and num == last[2] + 1:
+                last[2] = num; last[4] += 1
+            else:
+                blocks.append({"deck": last[0], "kind": last[1], "count": last[4], "start_number": last[3]})
+                last = [dk[0], dk[1], num, num, 1]
+        if last is not None:
+            blocks.append({"deck": last[0], "kind": last[1], "count": last[4], "start_number": last[3]})
+        return blocks
+
+    # --- URLs absolutas (sobre alias) ---
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        req = self.context.get("request")
+
+        def absurl(field):
+            f = getattr(instance, field, None)
+            if f and hasattr(f, "url"):
+                url = f.url
+                if req and url and not str(url).startswith(("http://", "https://")):
+                    return req.build_absolute_uri(url)
+                return url
+            return None
+
+        data["photo_front"] = absurl("photo1")
+        data["photo_back"]  = absurl("photo2")
+        data["photo_left"]  = absurl("photo3")
+        data["photo_right"] = absurl("photo4")
+        return data
+
+    # --- create ---
     def create(self, validated_data):
-        try:
-            return create_bus_with_code(validated_data)
-        except IntegrityError:
-            raise serializers.ValidationError({"code": "No se pudo generar un código único. Intenta nuevamente."})
+        seat_blocks = validated_data.pop("seat_blocks", None)
+        if seat_blocks:
+            self._validate_blocks_against_capacity(validated_data.get("capacity"), seat_blocks)
+        with transaction.atomic():
+            bus = create_bus_with_code(validated_data)
+            if seat_blocks:
+                create_seats_from_blocks(bus, seat_blocks, mode="fail_if_exists")
+            else:
+                create_default_seats_for_bus(bus, mode="fail_if_exists", deck=1)
+            return bus
 
+    # --- update ---
     def update(self, instance, validated_data):
-        validated_data.pop("code", None)  # code es inmutable
-        return super().update(instance, validated_data)
+        validated_data.pop("code", None)
+        seat_blocks = validated_data.pop("seat_blocks", None)
+
+        if seat_blocks:
+            capacity_target = validated_data.get("capacity", instance.capacity)
+            self._validate_blocks_against_capacity(capacity_target, seat_blocks)
+
+        with transaction.atomic():
+            if "capacity" in validated_data and not seat_blocks:
+                new_cap = int(validated_data["capacity"])
+                existing = instance.seats.count()
+                if new_cap < existing:
+                    raise serializers.ValidationError({
+                        "capacity": f"No puedes reducir la capacidad a {new_cap} porque ya existen {existing} asientos."
+                    })
+
+            bus = super().update(instance, validated_data)
+            if seat_blocks:
+                create_seats_from_blocks(bus, seat_blocks, mode="replace")
+            return bus
+
+# apps/catalog/serializers.py
+from django.db import transaction
+from rest_framework import serializers
+from catalog.models import Route, RouteStop, Office
 
 
-
-# ---------- ROUTES + STOPS (nested) ----------
+# ---- ROUTE STOPS (nested) ----
 class RouteStopSerializer(serializers.ModelSerializer):
+    # lectura cómoda
     office_code = serializers.CharField(source="office.code", read_only=True)
     office_name = serializers.CharField(source="office.name", read_only=True)
+
+    # escritura por id (si quieres también aceptar object completo, quita este campo)
+    office = serializers.PrimaryKeyRelatedField(queryset=Office.objects.all())
 
     class Meta:
         model = RouteStop
         fields = ("id", "office", "office_code", "office_name", "order", "scheduled_offset_min")
+        read_only_fields = ("id",)
 
 
 class RouteSerializer(serializers.ModelSerializer):
-    # Paradas anidadas (lectura y escritura)
+    """
+    Maneja create/update de Route + stops anidados.
+    Reglas:
+      - order empieza en 0 y es consecutivo (0..N)
+      - primera parada == origin; última parada == destination
+      - no se repiten oficinas dentro de la ruta
+    """
     stops = RouteStopSerializer(many=True)
 
+    # lectura de códigos (azúcar sintáctico)
     origin_code = serializers.CharField(source="origin.code", read_only=True)
     destination_code = serializers.CharField(source="destination.code", read_only=True)
 
     class Meta:
         model = Route
         fields = (
-            "id", "name", "origin", "origin_code", "destination", "destination_code",
-            "active", "created_at", "stops"
+            "id", "name",
+            "origin", "origin_code",
+            "destination", "destination_code",
+            "active", "created_at",
+            "stops",
         )
-        read_only_fields = ("created_at",)
+        read_only_fields = ("id", "created_at", "origin_code", "destination_code")
+
+    # -------- Validaciones de payload --------
+    def _validate_stops_payload(self, *, origin_id: int, destination_id: int, stops_data: list):
+        if not stops_data or len(stops_data) < 2:
+            raise serializers.ValidationError({"stops": "Debe haber al menos 2 paradas (origen y destino)."})
+
+        # orders consecutivos 0..N
+        orders = [s.get("order") for s in stops_data]
+        if any(o is None for o in orders):
+            raise serializers.ValidationError({"stops": "Cada parada debe incluir 'order'."})
+        if sorted(orders) != list(range(len(stops_data))):
+            raise serializers.ValidationError({"stops": "El 'order' debe ser consecutivo empezando en 0."})
+
+        # primera = origin, última = destination
+        first_office = stops_data[0].get("office")
+        last_office = stops_data[-1].get("office")
+        if int(first_office) != int(origin_id):
+            raise serializers.ValidationError({"stops": "La primera parada (order=0) debe ser la oficina de origen."})
+        if int(last_office) != int(destination_id):
+            raise serializers.ValidationError({"stops": "La última parada debe ser la oficina de destino."})
+
+        # no repetir oficinas
+        off_ids = [int(s.get("office")) for s in stops_data]
+        if len(off_ids) != len(set(off_ids)):
+            raise serializers.ValidationError({"stops": "No puede repetirse la misma oficina en la ruta."})
+
+        # opcional: forzar oficinas activas (si querés la regla aquí)
+        # inactivos = Office.objects.filter(id__in=off_ids, active=False).values_list("code", flat=True)
+        # if inactivos:
+        #     raise serializers.ValidationError({"stops": f"Oficinas inactivas: {', '.join(inactivos)}"})
 
     def validate(self, attrs):
-        # Si vienen stops en create/update, validar que no repitan offices y orden
-        stops_data = self.initial_data.get("stops")
+        # Para validar necesitamos origin/destination del objeto (create) o instancia (update)
+        data = self.initial_data or {}
+        stops_data = data.get("stops") or []
+
+        # Determinar origin/destination
+        origin_id = data.get("origin") if self.instance is None else (data.get("origin") or self.instance.origin_id)
+        destination_id = data.get("destination") if self.instance is None else (data.get("destination") or self.instance.destination_id)
+
+        if origin_id is None or destination_id is None:
+            # El propio model ya valida origen != destino; aquí solo exigimos presencia
+            raise serializers.ValidationError({"origin/destination": "Debe especificar origin y destination."})
+
         if stops_data:
-            seen_offices = set()
-            seen_orders = set()
-            for s in stops_data:
-                off = s.get("office")
-                ord_ = s.get("order")
-                if off in seen_offices:
-                    raise serializers.ValidationError({"stops": "No puede repetirse la misma oficina en la ruta."})
-                if ord_ in seen_orders:
-                    raise serializers.ValidationError({"stops": "No puede repetirse el mismo 'order'."})
-                seen_offices.add(off)
-                seen_orders.add(ord_)
+            self._validate_stops_payload(origin_id=int(origin_id), destination_id=int(destination_id), stops_data=stops_data)
+
         return attrs
 
+    # -------- Persistencia --------
+    @transaction.atomic
     def create(self, validated_data):
         stops_data = validated_data.pop("stops", [])
         route = Route.objects.create(**validated_data)
-        # bulk create stops
-        for s in stops_data:
-            RouteStop.objects.create(route=route, **s)
+
+        # crear stops en bloque
+        bulk = [
+            RouteStop(
+                route=route,
+                office=s["office"],
+                order=s["order"],
+                scheduled_offset_min=s.get("scheduled_offset_min"),
+            )
+            for s in stops_data
+        ]
+        RouteStop.objects.bulk_create(bulk)
         return route
 
+    @transaction.atomic
     def update(self, instance, validated_data):
         stops_data = validated_data.pop("stops", None)
-        instance = super().update(instance, validated_data)
 
-        # Si mandan stops, reemplazamos el set completo
+        # actualizar campos simples de Route
+        for k, v in validated_data.items():
+            setattr(instance, k, v)
+        instance.full_clean()  # respeta CheckConstraint origin != destination, etc.
+        instance.save()
+
+        # si mandan stops, reemplazamos el set completo
         if stops_data is not None:
             instance.stops.all().delete()
-            bulk = [RouteStop(route=instance, **s) for s in stops_data]
+            bulk = [
+                RouteStop(
+                    route=instance,
+                    office=s["office"],
+                    order=s["order"],
+                    scheduled_offset_min=s.get("scheduled_offset_min"),
+                )
+                for s in stops_data
+            ]
             RouteStop.objects.bulk_create(bulk)
+
         return instance
 
 

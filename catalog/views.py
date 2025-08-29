@@ -47,11 +47,56 @@ class OfficeViewSet(AdminWriteAuthenticatedReadMixin, viewsets.ModelViewSet):
     ordering_fields = ["code", "department", "province", "municipality", "locality", "name", "created_at"]
     ordering = ["code"]
 
+# apps/catalog/viewsets.py
+from django.db.models import Count
+from django_filters.rest_framework import DjangoFilterBackend
+from rest_framework import viewsets
+from rest_framework.decorators import action
+from rest_framework.response import Response
+from rest_framework.filters import SearchFilter, OrderingFilter
+from rest_framework import status
+from rest_framework.permissions import IsAuthenticated
+
+from .models import Bus, Seat
+from .serializers import BusSerializer, SeatBlockSerializer
+from .services import create_seats_from_blocks
 
 # ---------- BUSES ----------
+from django.db.models import Count
+from django.utils.decorators import method_decorator
+
+from rest_framework import viewsets, status
+from rest_framework.decorators import action
+from rest_framework.permissions import IsAuthenticated
+from rest_framework.response import Response
+
+from django_filters.rest_framework import DjangoFilterBackend
+from rest_framework.filters import SearchFilter, OrderingFilter
+
+from .models import Bus, Seat
+from .serializers import BusSerializer, SeatBlockSerializer
+from .services import create_seats_from_blocks  # ajusta el import si tu helper vive en otro módulo
+
+
 class BusViewSet(AdminWriteAuthenticatedReadMixin, viewsets.ModelViewSet):
-    queryset = Bus.objects.all()
+    """
+    - Soporta seat_blocks vía BusSerializer al crear/editar.
+    - Acciones extra:
+        * GET   /buses/{id}/seats/            -> listar asientos
+        * GET   /buses/{id}/seat-blocks/      -> bloques actuales (reconstruidos)
+        * POST  /buses/{id}/seats/regenerate/ -> reemplazar asientos con seat_blocks
+    """
+    queryset = (
+        Bus.objects
+        .all()
+        .prefetch_related("seats")          # ✅ evita N+1 en serializer y acciones
+        .order_by("code")
+        .annotate(_seats_count=Count("seats"))  # opcional para listas
+    )
     serializer_class = BusSerializer
+    permission_classes = [IsAuthenticated]  # AdminWriteAuthenticatedReadMixin ya limita escritura a admin
+
+    # Filtros/orden
     filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
     filterset_fields = {
         "active": ["exact"],
@@ -63,10 +108,118 @@ class BusViewSet(AdminWriteAuthenticatedReadMixin, viewsets.ModelViewSet):
     ordering_fields = ["code", "year", "plate", "created_at"]
     ordering = ["code"]
 
+    # ------- Acciones auxiliares --------
+
+    @action(detail=True, methods=["get"], url_path="seats")
+    def list_seats(self, request, pk=None):
+        """
+        Devuelve los asientos del bus:
+        [{id, number, deck, row, col, kind, is_accessible, active}, ...]
+        """
+        bus = self.get_object()
+        seats = (
+            Seat.objects
+            .filter(bus=bus)
+            .order_by("deck", "number")
+            .values("id", "number", "deck", "row", "col", "kind", "is_accessible", "active")
+        )
+        return Response(list(seats), status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["get"], url_path="seat-blocks")
+    def seat_blocks(self, request, pk=None):
+        """
+        Devuelve los bloques actuales reconstruidos desde los asientos:
+        [{deck, kind, count, start_number}, ...]
+        Útil para precargar el modal de edición.
+        """
+        bus = self.get_object()
+
+        # Mismo algoritmo que el SerializerMethodField `seat_blocks_current`
+        qs = (
+            bus.seats
+            .all()
+            .order_by("deck", "kind", "number")
+            .values("deck", "kind", "number")
+        )
+
+        blocks = []
+        last = None  # [deck, kind, prev_num, start, count]
+        for s in qs:
+            dk = (s["deck"], s["kind"])
+            num = s["number"]
+            if last is None:
+                last = [dk[0], dk[1], num, num, 1]
+                continue
+
+            same_group = (last[0] == dk[0] and last[1] == dk[1] and num == last[2] + 1)
+            if same_group:
+                last[2] = num
+                last[4] += 1
+            else:
+                blocks.append({
+                    "deck": last[0],
+                    "kind": last[1],
+                    "count": last[4],
+                    "start_number": last[3],
+                })
+                last = [dk[0], dk[1], num, num, 1]
+
+        if last is not None:
+            blocks.append({
+                "deck": last[0],
+                "kind": last[1],
+                "count": last[4],
+                "start_number": last[3],
+            })
+
+        return Response(blocks, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["post"], url_path="seats/regenerate")
+    def regenerate_seats(self, request, pk=None):
+        """
+        Reemplaza TODOS los asientos del bus con los bloques enviados.
+
+        Body:
+        {
+          "seat_blocks": [
+            {"deck":1, "kind":"SEMI_CAMA", "count":24, "start_number":1},
+            {"deck":2, "kind":"CAMA", "count":20, "start_number":25}
+          ]
+        }
+        """
+        bus = self.get_object()
+        data = request.data or {}
+        blocks = data.get("seat_blocks", [])
+
+        # Validar formato de bloques
+        serializer = SeatBlockSerializer(data=blocks, many=True)
+        serializer.is_valid(raise_exception=True)
+
+        # Validar coherencia con la capacidad
+        total = sum(int(b.get("count", 0)) for b in serializer.validated_data)
+        if total != bus.capacity:
+            return Response(
+                {"seat_blocks": f"La suma de 'count' ({total}) debe coincidir con 'capacity' ({bus.capacity})."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # Reemplazar asientos
+        created = create_seats_from_blocks(bus, serializer.validated_data, mode="replace")
+        return Response(
+            {"message": f"Asientos regenerados: {created} creados.", "created": created},
+            status=status.HTTP_200_OK,
+        )
+
 
 # ---------- ROUTES ----------
+
 class RouteViewSet(AdminWriteAuthenticatedReadMixin, viewsets.ModelViewSet):
-    queryset = Route.objects.prefetch_related("stops__office", "origin", "destination").all()
+    queryset = (
+        Route.objects
+        .select_related("origin", "destination")
+        .prefetch_related("stops__office")
+        .all()
+    )
     serializer_class = RouteSerializer
     filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
     filterset_fields = {
@@ -75,10 +228,38 @@ class RouteViewSet(AdminWriteAuthenticatedReadMixin, viewsets.ModelViewSet):
         "destination": ["exact"],
         "name": ["exact", "icontains"],
     }
-    search_fields = ["name", "origin__name", "destination__name"]
+    search_fields = ["name", "origin__name", "destination__name", "origin__code", "destination__code"]
     ordering_fields = ["name", "created_at"]
     ordering = ["name"]
 
+    @action(detail=True, methods=["patch"], url_path="reorder-stops")
+    def reorder_stops(self, request, pk=None):
+        """
+        Reordena las paradas manteniendo origen en 0 y destino al final.
+        Body: { "stop_ids": [ <ids de RouteStop en el nuevo orden> ] }
+        """
+        route = self.get_object()
+        stop_ids = request.data.get("stop_ids")
+        if not isinstance(stop_ids, list) or not stop_ids:
+            return Response({"detail": "stop_ids requerido (lista)."}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Paradas actuales
+        stops = list(route.stops.order_by("order").only("id", "order"))
+        current_ids_sorted = sorted(s.id for s in stops)
+        if sorted(stop_ids) != current_ids_sorted:
+            return Response({"detail": "Los IDs no coinciden con las paradas actuales."}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Origen/destino deben permanecer en extremos
+        if stop_ids[0] != stops[0].id or stop_ids[-1] != stops[-1].id:
+            return Response({"detail": "No puedes mover la parada de origen ni la de destino."}, status=status.HTTP_400_BAD_REQUEST)
+
+        # aplicar nuevo order
+        mapping = {sid: idx for idx, sid in enumerate(stop_ids)}
+        for s in stops:
+            s.order = mapping[s.id]
+        RouteStop.objects.bulk_update(stops, ["order"])
+
+        return Response(self.get_serializer(route).data, status=status.HTTP_200_OK)
 
 # ---------- DEPARTURES ----------
 class DepartureViewSet(AdminWriteAuthenticatedReadMixin, viewsets.ModelViewSet):
